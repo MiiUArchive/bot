@@ -1,0 +1,152 @@
+name: MiiUArchive Master Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-mirrors:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Bot Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Git Identity
+        run: |
+          git config --global user.name "MiiUArchive Bot"
+          git config --global user.email "bot@miiuarchive.l.cd"
+
+      - name: Clone and Verify Mirrors
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          echo "=================================================="
+          echo " Starting Mirrors Synchronization"
+          echo "=================================================="
+          git clone https://x-access-token:${{ secrets.BOT_PAT }}@github.com/miiuarchive/mirrors.git temp_mirrors
+
+          while IFS= read -r ORG; do
+            [ -z "$ORG" ] && continue
+            echo ""
+            echo "--------------------------------------------------"
+            echo " [Organization]: $ORG"
+            echo "--------------------------------------------------"
+            MIRRORS_DIR="temp_mirrors/$ORG"
+            mkdir -p "$MIRRORS_DIR"
+
+            REPOS=$(curl -s "https://api.github.com/orgs/$ORG/repos?per_page=100" | jq -r '.[].name // empty')
+
+            for REPO in $REPOS; do
+              echo "  -> Checking repository: $ORG/$REPO"
+              TARGET_GIT="$MIRRORS_DIR/$REPO"
+
+              if [ -d "$TARGET_GIT" ]; then
+                if [ ! -f "$TARGET_GIT/HEAD" ]; then
+                  echo "     [Warning] Repository corrupted (missing HEAD). Re-cloning..."
+                  rm -rf "$TARGET_GIT"
+                  git clone --mirror "https://github.com/$ORG/$REPO.git" "$TARGET_GIT" || echo "     [Error] Failed to re-clone repository."
+                else
+                  echo "     [Status] Updating existing mirror..."
+                  git --git-dir="$TARGET_GIT" remote update --prune || echo "     [Warning] Update failed (deleted, private, or network issue). Keeping local copy safe."
+                fi
+              else
+                echo "     [Status] Cloning mirror for the first time..."
+                git clone --mirror "https://github.com/$ORG/$REPO.git" "$TARGET_GIT" || echo "     [Error] Failed to clone repository."
+              fi
+            done
+          done < orgs.txt
+
+          echo ""
+          echo "=================================================="
+          echo " Committing and Pushing Changes to Mirrors Repo"
+          echo "=================================================="
+          cd temp_mirrors
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "[Bot]: Sync mirrors source code [$(date -u +'%Y-%m-%d')]"
+            git push origin main
+            echo " [Success] Mirrors repository updated successfully."
+          else
+            echo " [Info] No changes detected in mirrors."
+          fi
+
+  sync-releases:
+    needs: sync-mirrors
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Bot Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Git Identity
+        run: |
+          git config --global user.name "MiiUArchive Bot"
+          git config --global user.email "bot@miiuarchive.l.cd"
+
+      - name: Fetch Repository Releases
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          echo "=================================================="
+          echo " Starting Releases Synchronization"
+          echo "=================================================="
+          git clone https://x-access-token:${{ secrets.BOT_PAT }}@github.com/miiuarchive/releases.git temp_releases
+
+          while IFS= read -r ORG; do
+            [ -z "$ORG" ] && continue
+            echo ""
+            echo "--------------------------------------------------"
+            echo " [Organization]: $ORG"
+            echo "--------------------------------------------------"
+            
+            REPOS=$(curl -s "https://api.github.com/orgs/$ORG/repos?per_page=100" | jq -r '.[].name // empty')
+
+            for REPO in $REPOS; do
+              echo "  -> Checking releases for: $ORG/$REPO"
+              TAGS=$(gh release list --repo "$ORG/$REPO" --limit 100 2>/dev/null | awk -F'\t' '{print $3}' || true)
+              
+              if [ -z "$TAGS" ]; then
+                echo "     [Info] No releases found. Skipping..."
+                continue
+              fi
+
+              TARGET_REL="temp_releases/$ORG/$REPO"
+              mkdir -p "$TARGET_REL"
+
+              for TAG in $TAGS; do
+                if [ -n "$TAG" ]; then
+                  echo "     [Download] Fetching assets for tag: $TAG"
+                  mkdir -p "$TARGET_REL/$TAG"
+                  gh release download "$TAG" --repo "$ORG/$REPO" --dir "$TARGET_REL/$TAG" --clobber 2>/dev/null || true
+                  gh release download "$TAG" --repo "$ORG/$REPO" --archive=zip --dir "$TARGET_REL/$TAG" --clobber 2>/dev/null || true
+                  find "$TARGET_REL/$TAG" -type d -empty -delete
+                fi
+              done
+              
+              find "$TARGET_REL" -type d -empty -delete
+            done
+          done < orgs.txt
+
+          echo ""
+          echo "=================================================="
+          echo " Committing and Pushing Changes to Releases Repo"
+          echo "=================================================="
+          cd temp_releases
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "[Bot]: Sync multi-org releases [$(date -u +'%Y-%m-%d')]"
+            git push origin main
+            echo " [Success] Releases repository updated successfully."
+          else
+            echo " [Info] No changes detected in releases."
+          fi
+
+  finalize-sync:
+    needs: sync-releases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync Complete Notice
+        run: |
+          echo "=================================================="
+          echo " All synchronization tasks completed successfully!"
+          echo "=================================================="
